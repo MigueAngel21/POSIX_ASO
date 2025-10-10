@@ -1,0 +1,618 @@
+Para compilar : gcc -ggdb3 -Wall -Werror -Wno-unused -std=c11 exec_lines.c -o exec_lines
+
+
+#define _POSIX_C_SOURCE 200809L   // fuerza comportamientos POSIX modernos requeridos por el enunciado
+
+#include <errno.h>               // definiciones de errno y macros relacionadas
+#include <fcntl.h>               // constantes y flags para open()
+#include <getopt.h>              // getopt para parseo de opciones
+#include <signal.h>              // manejo de señales (sigaction, SIGCHLD)
+#include <stdarg.h>              // para funciones con argumentos variádicos (vfprintf)
+#include <stdbool.h>             // tipo bool en C
+#include <stdio.h>               // E/S estándar (printf, fprintf, perror...)
+#include <stdlib.h>              // utilidades generales (malloc, free, exit...)
+#include <string.h>              // manejo de cadenas (strdup, strtok_r, strlen...)
+#include <sys/stat.h>            // para tipos/stat si fueran necesarios
+#include <sys/types.h>           // tipos POSIX (pid_t, ssize_t...)
+#include <sys/wait.h>            // wait, waitpid, macros para estado de hijo
+#include <unistd.h>              // read, write, fork, exec, pipe, dup2
+
+/* ------------------------------------------------------------- */
+/* Constantes por defecto y límites (según enunciado y ejemplos) */
+/* ------------------------------------------------------------- */
+#define DEF_BUF_SIZE 16          // tamaño por defecto del buffer de lectura (-b)
+#define DEF_MAX_LINE 32          // tamaño por defecto máximo de línea (-l)
+#define DEF_NUM_PROCS 1          // número por defecto de líneas en paralelo (-p)
+
+#define MIN_BUF_ALLOWED 1        // límite inferior permitido para -b
+#define MAX_BUF_ALLOWED 8192     // límite superior permitido para -b
+
+#define MIN_LINE_ALLOWED 16      // límite inferior permitido para -l
+#define MAX_LINE_ALLOWED 1024    // límite superior permitido para -l
+
+#define MIN_PROCS 1              // límite inferior permitido para -p
+#define MAX_PROCS 8              // límite superior permitido para -p
+
+/* ------------------------------------------------------------- */
+/* Estructuras para controlar líneas activas (1 línea = 1 o 2 procesos) */
+/* ------------------------------------------------------------- */
+typedef struct line_proc {
+    int line_no;            // número de la línea del input (empezando en 1)
+    pid_t pids[2];          // pids de procesos que ejecutan la línea (si pipe: [0]=left [1]=right)
+    int nprocs;             // número de procesos que forman la línea (1 o 2)
+    int remaining;          // cuántos procesos quedan por terminar en esta línea
+    struct line_proc *next; // puntero siguiente para la lista enlazada de líneas activas
+} line_proc_t;
+
+/* ------------------------------------------------------------- */
+/* Estado global (flag de señal y lista de líneas activas) */
+/* ------------------------------------------------------------- */
+static volatile sig_atomic_t sigchld_flag = 0; // flag que pone el handler de SIGCHLD
+static line_proc_t *active_head = NULL;       // cabeza de la lista de líneas activas
+static int active_lines = 0;                  // contador de líneas activas (para -p)
+
+static int max_lines_parallel = DEF_NUM_PROCS; // número máximo de líneas en paralelo (opción -p)
+
+/* Datos del primer error ocurrido en hijos */
+static volatile sig_atomic_t found_error = 0;  // si se ha detectado la primera línea con fallo
+static int error_line_no = 0;                 // número de la línea que falló primero
+static int error_status = 0;                  // estado devuelto por wait() del proceso que falló
+
+/* ------------------------------------------------------------- */
+/* Gestión de la lista de líneas activas */
+/* ------------------------------------------------------------- */
+static line_proc_t* add_line_proc(int line_no, pid_t p1, pid_t p2, int nprocs) {
+    line_proc_t *lp = malloc(sizeof(line_proc_t)); // reservar memoria para la estructura
+    if (!lp) { perror("malloc"); exit(EXIT_FAILURE); } // si falla malloc, salir con error
+    lp->line_no = line_no;      // guardar número de línea
+    lp->pids[0] = p1;           // pid proceso 0 (o único)
+    lp->pids[1] = p2;           // pid proceso 1 (si no existe, se pasa -1)
+    lp->nprocs = nprocs;        // 1 o 2
+    lp->remaining = nprocs;     // inicialmente quedan nprocs por terminar
+    lp->next = active_head;     // insertar al principio de la lista enlazada
+    active_head = lp;           // actualizar cabeza
+    active_lines++;             // incrementar contador de líneas activas
+    return lp;                  // devolver puntero a la estructura creada
+}
+
+static line_proc_t* find_line_proc_by_pid(pid_t pid) {
+    line_proc_t *cur = active_head; // empezar por la cabeza
+    while (cur) {
+        for (int i = 0; i < cur->nprocs; ++i) { // revisar los pids almacenados
+            if (cur->pids[i] == pid) return cur; // si coincide, devolver esa estructura
+        }
+        cur = cur->next; // avanzar en la lista
+    }
+    return NULL; // si no se encuentra, devolver NULL
+}
+
+static void remove_line_proc(line_proc_t *lp) {
+    line_proc_t **pp = &active_head; // puntero al puntero que recorre la lista
+    while (*pp) {
+        if (*pp == lp) {           // si encontramos el nodo a eliminar
+            *pp = lp->next;        // enlazar saltando el nodo
+            free(lp);              // liberar memoria
+            active_lines--;        // decrementar contador de líneas activas
+            return;                // salir
+        }
+        pp = &((*pp)->next);       // avanzar
+    }
+}
+
+/* ------------------------------------------------------------- */
+/* Manejo de SIGCHLD: el handler solo pone una flag (operación segura) */
+/* ------------------------------------------------------------- */
+static void sigchld_handler(int signo) {
+    (void)signo;           // evitamos warning por parámetro no usado
+    sigchld_flag = 1;      // señalizamos que hay hijos terminados por recolectar
+}
+
+/* ------------------------------------------------------------- */
+/* Recolección no bloqueante de hijos: waitpid con WNOHANG */
+/* ------------------------------------------------------------- */
+static void reap_children_nonblock(void) {
+    int status;            // variable donde waitpid deposita el estado
+    pid_t pid;             // pid devuelto por waitpid
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) { // reap mientras haya hijos terminados
+        line_proc_t *lp = find_line_proc_by_pid(pid);   // buscar la línea asociada a ese pid
+        if (!lp) {
+            // hijo desconocido: lo ignoramos (no debería pasar normalmente)
+            continue;
+        }
+        lp->remaining--; // reducir contador de procesos pendientes para esa línea
+        if (!found_error) { // si no habíamos detectado aún un fallo
+            if (WIFEXITED(status)) {                      // si terminó normalmente
+                int rc = WEXITSTATUS(status);
+                if (rc != 0) {                            // y con código distinto de 0 -> error
+                    found_error = 1;                      // marcar primer error
+                    error_line_no = lp->line_no;         // guardar línea que falló
+                    error_status = status;               // guardar estado para mensaje posterior
+                }
+            } else if (WIFSIGNALED(status)) {             // si acabó por señal
+                found_error = 1;                          // marcar primer error
+                error_line_no = lp->line_no;             // guardar línea que falló
+                error_status = status;                   // guardar estado
+            }
+        }
+        if (lp->remaining == 0) { // si ya no quedan procesos en la línea
+            remove_line_proc(lp);  // eliminar la estructura de la lista
+        }
+    }
+    sigchld_flag = 0; // limpiar la flag (ya hemos reaped lo que había)
+}
+
+/* ------------------------------------------------------------- */
+/* Espera bloqueante a que termine algún hijo (wait), y actualizar estado */
+/* ------------------------------------------------------------- */
+static void wait_for_one_child(void) {
+    int status;            // estado del hijo terminado
+    pid_t pid;             // pid del hijo terminado
+    while ((pid = wait(&status)) < 0) { // wait bloquea hasta que algún hijo termine
+        if (errno == EINTR) continue;   // si fue interrumpido por señal, reintentar
+        else break;                      // otro error -> salir del loop
+    }
+    if (pid > 0) {                       // si wait devolvió un pid válido
+        line_proc_t *lp = find_line_proc_by_pid(pid); // buscar la línea correspondiente
+        if (lp) {
+            lp->remaining--; // decrementar procesos pendientes
+            if (!found_error) {
+                if (WIFEXITED(status)) {
+                    int rc = WEXITSTATUS(status);
+                    if (rc != 0) {
+                        found_error = 1;              // registrar el primer error si hay código != 0
+                        error_line_no = lp->line_no;
+                        error_status = status;
+                    }
+                } else if (WIFSIGNALED(status)) {
+                    found_error = 1;                  // registrar si terminó por señal
+                    error_line_no = lp->line_no;
+                    error_status = status;
+                }
+            }
+            if (lp->remaining == 0) remove_line_proc(lp); // si la línea ya terminó, eliminar
+        }
+    }
+}
+
+/* ------------------------------------------------------------- */
+/* Utilidades para manejar y mostrar líneas (trim, preview) */
+/* ------------------------------------------------------------- */
+static void rstrip_newline(char *s) {        // quitar \n final si existe
+    size_t n = strlen(s);
+    if (n > 0 && s[n-1] == '\n') s[n-1] = '\0';
+}
+
+static void show_line_preview(const char *line, size_t max) { // mostrar vista previa con truncamiento
+    size_t len = strlen(line);
+    if (len <= max) {
+        fprintf(stderr, "\"%s\"\n", line);
+    } else {
+        char *tmp = malloc(max + 4); // espacio para '...' y '\0'
+        if (!tmp) { fprintf(stderr, "\"...\"\n"); return; }
+        strncpy(tmp, line, max);
+        tmp[max] = '\0';
+        fprintf(stderr, "\"%s...\"\n", tmp);
+        free(tmp);
+    }
+}
+
+/* ------------------------------------------------------------- */
+/* Parsing simple de argumentos (separa por espacios). No soporta comillas */
+/* ------------------------------------------------------------- */
+static char **parse_args(char *segment) {
+    int capacity = 8;                     // capacidad inicial del array argv
+    char **argv = malloc(sizeof(char*) * capacity); // reservar array de punteros
+    if (!argv) { perror("malloc"); exit(EXIT_FAILURE); }
+    int argc = 0;                          // contador de argumentos
+    char *saveptr = NULL;                  // para strtok_r (reentrante)
+    char *tok = strtok_r(segment, " ", &saveptr); // tokenizar por espacios
+    while (tok) {
+        if (argc + 1 >= capacity) {
+            capacity *= 2;                // duplicar capacidad si se necesita
+            argv = realloc(argv, sizeof(char*) * capacity);
+            if (!argv) { perror("realloc"); exit(EXIT_FAILURE); }
+        }
+        argv[argc++] = tok;                // almacenar puntero al token
+        tok = strtok_r(NULL, " ", &saveptr);// siguiente token
+    }
+    argv[argc] = NULL;                     // argv debe terminar en NULL para execvp
+    return argv;                           // devolver array (memoria debe liberarse por el llamador)
+}
+
+/* ------------------------------------------------------------- */
+/* Ejecutar un único comando (sin pipes). fd_in/fd_out si != -1 se usan para redirección */
+/* ------------------------------------------------------------- */
+static pid_t launch_single(char *cmdline, int fd_in, int fd_out) {
+    char *copy = strdup(cmdline);          // duplicar la cadena porque parse_args la modifica
+    if (!copy) { perror("strdup"); exit(EXIT_FAILURE); }
+    char **argv = parse_args(copy);        // obtener argv
+    if (!argv[0]) { free(argv); free(copy); return -1; } // línea vacía -> nada que ejecutar
+    pid_t pid = fork();                    // crear proceso
+    if (pid < 0) {
+        perror("fork");                  // error al forkear
+        free(argv); free(copy);
+        return -1;
+    } else if (pid == 0) {
+        // hijo: establecer redirecciones si se proporcionaron descriptores
+        if (fd_in != -1) {
+            if (dup2(fd_in, STDIN_FILENO) == -1) { perror("dup2"); _exit(127); }
+        }
+        if (fd_out != -1) {
+            if (dup2(fd_out, STDOUT_FILENO) == -1) { perror("dup2"); _exit(127); }
+        }
+        execvp(argv[0], argv);              // ejecutar comando (reemplaza el proceso)
+        // si execvp devuelve, hubo error
+        fprintf(stderr, "Error ejecutando '%s': %s\n", argv[0], strerror(errno));
+        _exit(127);                         // salir con código distintivo
+    }
+    // padre: liberar recursos temporales y devolver pid del hijo
+    free(argv); free(copy);
+    return pid;
+}
+
+/* ------------------------------------------------------------- */
+/* Lanzar pipeline left | right: crea pipe y dos hijos conectados */
+/* ------------------------------------------------------------- */
+static int launch_pipeline(char *left_cmd, char *right_cmd, pid_t *p_left, pid_t *p_right) {
+    int pipefd[2];                          // descriptores de la pipe
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        return -1;
+    }
+    pid_t pl = fork();                      // fork para el proceso izquierdo
+    if (pl < 0) { perror("fork"); close(pipefd[0]); close(pipefd[1]); return -1; }
+    if (pl == 0) {
+        // hijo izquierdo: dup stdout -> extremo de escritura de la pipe
+        if (dup2(pipefd[1], STDOUT_FILENO) == -1) { perror("dup2"); _exit(127); }
+        close(pipefd[0]); close(pipefd[1]); // cerrar extremos que no usa
+        char *copy = strdup(left_cmd);       // preparar argv
+        if (!copy) { perror("strdup"); _exit(127); }
+        char **argv = parse_args(copy);
+        if (!argv[0]) { free(argv); free(copy); _exit(0); }
+        execvp(argv[0], argv);               // ejecutar comando izquierdo
+        fprintf(stderr, "Error ejecutando '%s': %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    pid_t pr = fork();                      // fork para el proceso derecho
+    if (pr < 0) { perror("fork"); close(pipefd[0]); close(pipefd[1]); return -1; }
+    if (pr == 0) {
+        // hijo derecho: dup stdin <- extremo de lectura de la pipe
+        if (dup2(pipefd[0], STDIN_FILENO) == -1) { perror("dup2"); _exit(127); }
+        close(pipefd[0]); close(pipefd[1]);
+        char *copy = strdup(right_cmd);
+        if (!copy) { perror("strdup"); _exit(127); }
+        char **argv = parse_args(copy);
+        if (!argv[0]) { free(argv); free(copy); _exit(0); }
+        execvp(argv[0], argv);
+        fprintf(stderr, "Error ejecutando '%s': %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    close(pipefd[0]); close(pipefd[1]);     // padre cierra ambos extremos de la pipe
+    *p_left = pl;                           // devolver pids creados al llamador
+    *p_right = pr;
+    return 0;                                // éxito
+}
+
+/* ------------------------------------------------------------- */
+/* Abrir fichero para redirección según modo: '<', '>' o 'a' (>>). */
+/* ------------------------------------------------------------- */
+static int open_redirect_file(const char *path, char mode) {
+    if (mode == '<') {
+        int fd = open(path, O_RDONLY);     // abrir para lectura
+        if (fd == -1) {
+            fprintf(stderr, "Error al abrir fichero entrada '%s': %s\n", path, strerror(errno));
+        }
+        return fd;
+    } else if (mode == '>') {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666); // truncar
+        if (fd == -1) {
+            fprintf(stderr, "Error al abrir fichero salida '%s': %s\n", path, strerror(errno));
+        }
+        return fd;
+    } else {
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666); // append (>>)
+        if (fd == -1) {
+            fprintf(stderr, "Error al abrir fichero salida '%s': %s\n", path, strerror(errno));
+        }
+        return fd;
+    }
+}
+
+/* ------------------------------------------------------------- */
+/* Mensaje de uso / ayuda */
+/* ------------------------------------------------------------- */
+static void usage_and_exit(int code) {
+    fprintf(stderr, "Uso: ./exec_lines [-b BUF_SIZE] [-l MAX_LINE_SIZE] [-p NUM_PROCS] \n");
+    fprintf(stderr, "Lee de la entrada estándar una secuencia de líneas conteniendo órdenes \n");
+    fprintf(stderr, "para ser ejecutadas y lanza los procesos necesarios para ejecutar cada \n");
+    fprintf(stderr, "línea, esperando a su terminación para ejecutar la siguiente. \n");
+    fprintf(stderr, "-b BUF_SIZE         Tamaño del buffer de entrada 1<=BUF_SIZE<=8192 \n");
+    fprintf(stderr, "-l MAX_LINE_SIZE    Tamaño máximo de línea 16<=MAX_LINE_SIZE<=1024 \n");
+    fprintf(stderr, "-p NUM_PROCS     Número de procesos en ejecución de forma simultánea (1 <= \n");
+    fprintf(stderr, "NUM_PROCS <= 8) \n");
+    exit(code);                                // salir con el código dado
+}
+
+/* ------------------------------------------------------------- */
+/* main: flujo principal: parseo de opciones, lectura con read(), parsing y ejecución */
+/* ------------------------------------------------------------- */
+int main(int argc, char *argv[]) {
+    int buf_size = DEF_BUF_SIZE;             // variable para -b
+    int max_line_size = DEF_MAX_LINE;       // variable para -l
+    int num_procs = DEF_NUM_PROCS;          // variable para -p
+
+    int opt;                                 // variable para getopt
+    while ((opt = getopt(argc, argv, "b:l:p:h")) != -1) { // parseo de opciones
+        switch (opt) {
+            case 'b':
+                errno = 0;                    // limpiar errno antes de strtol
+                buf_size = (int)strtol(optarg, NULL, 10); // convertir argumento a int
+                break;
+            case 'l':
+                errno = 0;
+                max_line_size = (int)strtol(optarg, NULL, 10);
+                break;
+            case 'p':
+                errno = 0;
+                num_procs = (int)strtol(optarg, NULL, 10);
+                break;
+            case 'h':
+            default:
+                usage_and_exit(opt == 'h' ? 0 : 1); // mostrar ayuda o error
+        }
+    }
+
+    /* Validaciones de rango de opciones */
+    if (buf_size < MIN_BUF_ALLOWED || buf_size > MAX_BUF_ALLOWED) {
+        fprintf(stderr, "Error: El tamaño de buffer tiene que estar entre 1 y 8192.\n");
+        exit(1);
+    }
+    if (max_line_size < MIN_LINE_ALLOWED || max_line_size > MAX_LINE_ALLOWED) {
+        fprintf(stderr, "Error: El tamaño máximo de línea tiene que estar entre 16 y 1024.\n");
+        exit(1);
+    }
+    if (num_procs < MIN_PROCS || num_procs > MAX_PROCS) {
+        fprintf(stderr, "Error: El número de procesos en ejecución tiene que estar entre 1 y 8.\n");
+        usage_and_exit(1);
+    }
+
+    max_lines_parallel = num_procs;          // fijar límite de paralelismo por líneas
+
+    /* instalar handler de SIGCHLD */
+    struct sigaction sa;                     // estructura para sigaction
+    sa.sa_handler = sigchld_handler;         // asignar nuestro handler
+    sigemptyset(&sa.sa_mask);                // máscara vacía
+    sa.sa_flags = SA_RESTART;                // reiniciar syscalls cuando sea posible
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) { // instalar handler
+        perror("sigaction");
+        exit(1);
+    }
+
+    /* reservar buffers: uno para read() y otro para ir construyendo la línea */
+    char *inbuf = malloc(buf_size);          // buffer de lectura de tamaño buf_size
+    if (!inbuf) { perror("malloc"); exit(1); }
+    char *linebuf = malloc(max_line_size + 2); // buffer para la línea actual (+ espacio para \n y \0)
+    if (!linebuf) { perror("malloc"); exit(1); }
+    size_t line_used = 0;                    // cuantos bytes hemos usado en linebuf
+
+    ssize_t nread;                           // bytes leídos por read()
+    int line_no = 1;                         // contador de líneas leídas (empezando en 1)
+    bool stop_reading = false;               // si se detecta error en hijo, dejamos de lanzar nuevas líneas
+
+    /* bucle principal de lectura por bloques */
+    while (!stop_reading) {
+        nread = read(STDIN_FILENO, inbuf, buf_size); // leer hasta buf_size bytes de stdin
+        if (nread < 0) {
+            if (errno == EINTR) {            // si read fue interrumpido por señal
+                if (sigchld_flag) reap_children_nonblock(); // procesar hijos terminados
+                continue;                      // reintentar lectura
+            } else {
+                perror("read"); exit(1);     // otro error irrecoverable
+            }
+        } else if (nread == 0) {
+            // EOF: si hay contenido pendiente en linebuf, considerarlo como última línea
+            if (line_used > 0) {
+                linebuf[line_used] = '\n';   // añadir fin de línea implícito
+                line_used++;
+                linebuf[line_used] = '\0';
+            } else {
+                break;                        // fin normal de entrada
+            }
+        } else {
+            /* procesar cada carácter leido y acumular hasta \n */
+            for (ssize_t i = 0; i < nread; ++i) {
+                char c = inbuf[i];           // carácter actual
+                if (c == '\n') {
+                    /* final de línea: cerrar la cadena y comprobar longitud */
+                    linebuf[line_used] = '\n';
+                    line_used++;
+                    linebuf[line_used] = '\0';
+
+                    if ((int)line_used - 1 > max_line_size) { // si superamos max_line_size
+                        fprintf(stderr, "Error, línea %d demasiado larga: ", line_no);
+                        rstrip_newline(linebuf); // quitar \n para hacer preview
+                        show_line_preview(linebuf, 60); // mostrar preview truncado
+                        free(inbuf); free(linebuf);
+                        exit(1);             // terminar con error
+                    }
+
+                    char *line = strndup(linebuf, line_used); // copiar línea para modificarla
+                    if (!line) { perror("strdup"); exit(1); }
+                    rstrip_newline(line);    // quitar el \n final para procesar
+
+                    if (sigchld_flag) reap_children_nonblock(); // si SIGCHLD, reap ahora
+
+                    if (found_error) { free(line); stop_reading = true; break; } // si ya hubo error, no arrancar más
+
+                    /* si hay demasiadas líneas activas, esperar a que libere alguna */
+                    while (active_lines >= max_lines_parallel && !found_error) {
+                        wait_for_one_child(); // bloqueante hasta que termine alguna línea
+                    }
+                    if (found_error) { free(line); stop_reading = true; break; }
+
+                    /* ignorar líneas en blanco (solo espacios/tabs) */
+                    bool only_spaces = true;
+                    for (size_t k = 0; k < strlen(line); ++k) {
+                        if (line[k] != ' ' && line[k] != '\t' && line[k] != '\r') { only_spaces = false; break; }
+                    }
+                    if (only_spaces) {
+                        free(line);
+                        line_used = 0;
+                        line_no++;
+                        continue; // pasar a la siguiente línea de entrada
+                    }
+
+                    /* tokenizar por espacios para detectar operadores especiales */
+                    char *lncopy = strdup(line);
+                    if (!lncopy) { perror("strdup"); exit(EXIT_FAILURE); }
+                    char *saveptr = NULL;
+                    char *t = strtok_r(lncopy, " ", &saveptr);
+                    int special_count = 0;
+                    char special = 0; // '<', '>', 'a'(>>) o '|'
+                    int special_token_index = -1;
+                    char *tokens[1024];
+                    int ntok = 0;
+                    while (t && ntok < 1023) {
+                        tokens[ntok++] = t;                    // guardar token
+                        if (strcmp(t, "<") == 0) { special_count++; special = '<'; special_token_index = ntok-1; }
+                        else if (strcmp(t, ">") == 0) { special_count++; special = '>'; special_token_index = ntok-1; }
+                        else if (strcmp(t, ">>") == 0) { special_count++; special = 'a'; special_token_index = ntok-1; }
+                        else if (strcmp(t, "|") == 0) { special_count++; special = '|'; special_token_index = ntok-1; }
+                        t = strtok_r(NULL, " ", &saveptr);   // siguiente token
+                    }
+                    tokens[ntok] = NULL;                     // NULL-terminate
+
+                    if (special_count > 1) {
+                        fprintf(stderr, "Error, línea %d contiene más de un operador especial.\n", line_no);
+                        free(lncopy); free(line); free(inbuf); free(linebuf);
+                        exit(1);
+                    }
+
+                    if (special_count == 0) {
+                        /* comando simple sin redirecciones ni pipes */
+                        pid_t pid = launch_single(line, -1, -1);
+                        if (pid > 0) add_line_proc(line_no, pid, -1, 1);
+                    } else {
+                        if (special == '|') {
+                            /* tubería: reconstruir left y right a partir de tokens */
+                            if (special_token_index <= 0 || special_token_index >= ntok-1) {
+                                fprintf(stderr, "Error, línea %d con tubería mal formada.\n", line_no);
+                                free(lncopy); free(line); free(inbuf); free(linebuf);
+                                exit(1);
+                            }
+                            size_t left_len = 0, right_len = 0;
+                            for (int i = 0; i < special_token_index; ++i) left_len += strlen(tokens[i]) + 1;
+                            for (int i = special_token_index+1; i < ntok; ++i) right_len += strlen(tokens[i]) + 1;
+                            char *left = malloc(left_len+1);
+                            char *right = malloc(right_len+1);
+                            if (!left || !right) { perror("malloc"); exit(1); }
+                            left[0] = '\0'; right[0] = '\0';
+                            for (int i = 0; i < special_token_index; ++i) {
+                                strcat(left, tokens[i]);
+                                if (i+1 < special_token_index) strcat(left, " ");
+                            }
+                            for (int i = special_token_index+1; i < ntok; ++i) {
+                                strcat(right, tokens[i]);
+                                if (i+1 < ntok) strcat(right, " ");
+                            }
+                            pid_t pl=-1, pr=-1;
+                            if (launch_pipeline(left, right, &pl, &pr) == -1) {
+                                free(left); free(right); free(lncopy); free(line);
+                                free(inbuf); free(linebuf);
+                                exit(1);
+                            }
+                            add_line_proc(line_no, pl, pr, 2); // contar la tubería como una línea activa
+                            free(left); free(right);
+                        } else {
+                            /* redirección: reconstruir comando y abrir fichero */
+                            if (special_token_index <= 0 || special_token_index >= ntok-1) {
+                                fprintf(stderr, "Error, línea %d con redirección mal formada.\n", line_no);
+                                free(lncopy); free(line); free(inbuf); free(linebuf);
+                                exit(1);
+                            }
+                            size_t cmdlen = 0;
+                            for (int i = 0; i < special_token_index; ++i) cmdlen += strlen(tokens[i]) + 1;
+                            char *cmd = malloc(cmdlen+1);
+                            if (!cmd) { perror("malloc"); exit(1); }
+                            cmd[0] = '\0';
+                            for (int i = 0; i < special_token_index; ++i) {
+                                strcat(cmd, tokens[i]);
+                                if (i+1 < special_token_index) strcat(cmd, " ");
+                            }
+                            char *fname = tokens[special_token_index+1]; // nombre de fichero destino/origen
+                            int fd = -1;
+                            if (special == '<') fd = open_redirect_file(fname, '<');
+                            else if (special == '>') fd = open_redirect_file(fname, '>');
+                            else if (special == 'a') fd = open_redirect_file(fname, 'a');
+                            if (fd == -1) {
+                                free(cmd); free(lncopy); free(line);
+                                free(inbuf); free(linebuf);
+                                exit(1);
+                            }
+                            int use_in = -1, use_out = -1;
+                            if (special == '<') use_in = fd; else use_out = fd;
+                            pid_t pid = launch_single(cmd, use_in, use_out);
+                            close(fd); // cerrar descriptor en padre
+                            if (pid > 0) add_line_proc(line_no, pid, -1, 1);
+                            free(cmd);
+                        }
+                    }
+
+                    free(lncopy); free(line);
+
+                    line_used = 0; // reiniciar buffer de línea para la siguiente
+                    line_no++;     // incrementar contador de líneas
+
+                    if (sigchld_flag) reap_children_nonblock(); // reap si llegó SIGCHLD mientras arrancábamos procesos
+
+                } else {
+                    /* carácter normal: añadirlo al buffer de la línea */
+                    if (line_used + 1 >= (size_t)(max_line_size + 2)) {
+                        fprintf(stderr, "Error, línea %d demasiado larga: \"", line_no);
+                        linebuf[line_used] = '\0';
+                        show_line_preview(linebuf, 60);
+                        free(inbuf); free(linebuf);
+                        exit(1);
+                    }
+                    linebuf[line_used++] = c; // acumular carácter
+                }
+            } // fin for bytes leídos
+        } // fin else nread > 0
+
+        if (sigchld_flag) reap_children_nonblock(); // reap si ha habido señales entre iteraciones
+
+        if (found_error) break; // si detectamos un error, salir del bucle de lectura
+    } // fin while lectura
+
+    free(inbuf); free(linebuf); // liberar buffers usados para lectura
+
+    /* Si hubo un error en algún hijo, esperar que acaben las líneas activas y mostrar mensaje */
+    if (found_error) {
+        while (active_lines > 0) {
+            if (sigchld_flag) reap_children_nonblock();
+            wait_for_one_child();
+            if (sigchld_flag) reap_children_nonblock();
+        }
+        if (WIFEXITED(error_status)) {
+            int rc = WEXITSTATUS(error_status);
+            fprintf(stderr, "Error al ejecutar la línea %d. Terminación normal con código %d.\n", error_line_no, rc);
+        } else if (WIFSIGNALED(error_status)) {
+            int sig = WTERMSIG(error_status);
+            fprintf(stderr, "Error al ejecutar la línea %d. Terminación anormal por señal %d.\n", error_line_no, sig);
+        } else {
+            fprintf(stderr, "Error al ejecutar la línea %d. Terminación desconocida.\n", error_line_no);
+        }
+        return 1; // devolver código de error
+    } else {
+        /* Si no hubo errores, esperar a que terminen las líneas restantes y acabar normalmente */
+        while (active_lines > 0) {
+            if (sigchld_flag) reap_children_nonblock();
+            wait_for_one_child();
+            if (sigchld_flag) reap_children_nonblock();
+        }
+    }
+
+    return 0; // fin exitoso
+}
